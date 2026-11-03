@@ -1,0 +1,252 @@
+===========================================================================
+RIASSUNTO TL57.SYS - Memoria, banchi e struttura routine
+Apple IIgs demo "Timeless tunnel" - porting 65816 da timeless.c
+===========================================================================
+
+Questo file descrive TL57.SYS: la versione che aggiunge la neve vera
+(R_L1P60) e la pioggia vera a righette diagonali (R_L1P80) al ciclo
+automatico delle animazioni, oltre al fix del clamp BLIT_BASE_X/Y gia'
+validato in tl56d.s. E' basato su tl56r.s (la ricostruzione pulita:
+tl54 + le 3 fasi intro di tl55r + il vero effetto pioggia/cuoricini
+R_L1P90), con le sole aggiunte descritte qui sotto.
+
+
+---------------------------------------------------------------------------
+1) COME E' ORGANIZZATA LA MEMORIA (banchi)
+---------------------------------------------------------------------------
+
+Banco $00 - programma e dati "piccoli"
+  - ORG $2000: qui parte il codice (formato SYS per ProDOS 8).
+  - Zero page / direct page $00-$FF: variabili di stato di tutte le
+    routine (vedi sezione 2 sotto per il dettaglio).
+  - Tutte le tabelle dati "ragionevolmente piccole" vivono qui insieme
+    al codice: sprite (CSPRxx_DATA), tabelle di curve/seno (SIN320 ecc.),
+    LEAFX_TABLE/LEAFY_TABLE (pioggia/cuoricini R_L1P90), le nuove
+    RAIN2_Y0/X0/Y1/X1/Y2/X2 e SNOW_Y0/X0/Y1/X1/Y2/X2 (posizioni
+    precalcolate di R_L1P80/R_L1P60), la palette COLOR_DATA, ecc.
+  - Nota tecnica: D (direct page) e S (stack) sul 65816 sono per
+    costruzione sempre nel banco $00, quindi PEI/PHA non possono mai
+    scrivere fuori da qui: e' per questo che i banchi con i dati grossi
+    (VRAM, texture, gnbgtbl) sono raggiunti sempre con indirizzamento
+    assoluto lungo (STA >ETICHETTA,X) e mai via stack.
+
+Banco $01 - VRAM (schermo reale)
+  - FAST_SHR EQU $2000 / FAST_SHR_LONG EQU $012000: offset e indirizzo
+    assoluto lungo della VRAM Super Hi-Res, area $2000-$9FFF (320x200,
+    packing 2 pixel/byte, un nibble ciascuno).
+  - ATTENZIONE (bug trovato e corretto in questa versione): l'area VRAM
+    del banco $01 a partire dall'offset $9D00 e' agganciata via
+    shadowing hardware del IIgs alla STESSA memoria fisica della SCB
+    (Scan Control Byte, banco $E1 offset $9D00 = SCB_BASE $E19D00) e
+    poco oltre alla PALETTE hardware (banco $E1 offset $9E00 = PALETTE
+    $E19E00). Scrivere un pixel a riga >=200 (fuori schermo) corrompe
+    quindi silenziosamente la SCB e la palette invece di essere
+    "innocuo": e' la causa dei colori strani/sfondo sporcato osservati
+    con R_L1P90 prima del fix del clamp (vedi sezione 3).
+
+Banco $02 - texture offscreen
+  - OFFSCREEN_BASE EQU $020000: un banco intero (256x256 = 65536 byte,
+    un texel per byte) usato come texture di prova/composizione,
+    riempita da GENERATE_OFFSCREEN / CLEAR_OFFSCREEN_FLAT e dalle fasi
+    dell'intro (curva, punti, linee, margherite a cluster).
+
+Banco $03 - tabella tunnel (gnbgtbl)
+  - GNBGTBL_BASE EQU $030000: tabella precalcolata per il rendering del
+    tunnel prospettico (GNBG_RENDER), circa 16000 byte usati su tutto
+    il banco, costruita una sola volta da INIT_GNBGTBL.
+
+Banco $04 - PACKLUT
+  - Banco intero (65536 voci) di lookup per il packing dei nibble,
+    costruito da INIT_PACKLUT, usato per velocizzare la composizione
+    pixel durante il rendering del tunnel.
+
+Banchi $0D/$0E - dati musica
+  - RAIN.NTP (il modulo musicale) viene caricato qui da MUSIC_INIT.
+
+Banco $0F - player musicale
+  - NTPPLAYER (il motore di riproduzione) viene caricato qui.
+
+Banco $E1 - hardware SCB/palette (fisicamente la stessa area del
+  banco $01 da $9D00 in su, per shadowing hardware, vedi sopra)
+  - SCB_BASE EQU $E19D00, PALETTE EQU $E19E00: scritti direttamente da
+    SET_SCB_RANGE e INIT_PALETTE con STA >ETICHETTA,X.
+
+
+---------------------------------------------------------------------------
+2) ZERO PAGE / DIRECT PAGE ($00-$FF) - come sono raggruppati i campi
+---------------------------------------------------------------------------
+
+La zona $00-$7F e' riservata a stato PERSISTENTE che deve sopravvivere
+turno dopo turno anche mentre altre routine L1 sono attive (pesce,
+lumaca, icona/petali, pioggia vera R_L1P90). La zona $80-$FF e' invece
+condivisa fra routine "scratch" che si escludono a vicenda nello stesso
+frame (curve/margherite dell'intro, rendering del tunnel, blit sprite):
+questi campi vengono ricalcolati da zero a ogni uso e possono quindi
+essere alias (stesso indirizzo) fra routine diverse, purche' non attive
+nello stesso momento.
+
+Gruppo A - stato persistente, $00-$7F (mai toccato da altre parti):
+  $02-$0C  FISH_X/Y/DX/DY/CNTR/FRAME       (pesce)
+  $0E-$1A  SNAIL_X/Y/DX/DY/CNTR/FRAME, STAMP_TIMER   (lumaca)
+  $1C-$20, $30-$32  ICON_X/STEP/INDEX, ICON_Y/BOBTMP (icona volante)
+  $22-$36  RAIN_DPHASE0/1, RAIN_CNTR/NUM/NUMD, RAIN_TY/TX/T
+           (R_L1P90: pioggia/cuoricini/foglie - "a 16 bit sempre
+           puliti", MAI un SEP #$20 dentro questa routine: un vecchio
+           crash e' stato causato esattamente da un'etichetta
+           raggiunta con lo stato 8/16 bit sbagliato)
+  $44-$4C  INTRO_PHASE, INTRO_JUMP_PTR, DOTS_COUNTER, LINES_COUNTER
+           (fasi dell'intro: curva/punti/linee/cluster margherite)
+  $60-$6E  HAPPY_CNTR, ORBIT_X/PHASE/INDEX/DX/TMP/SPRTMP/I
+           (faccine e orbita)
+  $72-$7F  CURVE_LOC/LOCD/COLOR/COUNTER, FILL_LOC/LOCD/CNTR/PACE,
+           FILL_ICONIDX (margherita che si riempie/cresce)
+
+Gruppo B - scratch condiviso, $80-$FF (alias fra routine mutuamente
+esclusive nello stesso frame):
+  VIEW_X/VIEW_Y ($82/$84): posizione di vista nel tunnel (mover).
+  MULA/MULB, PRODLO/PRODHI ($AC-$B9): moltiplicazione con segno
+    generica, usata da GNBG_RENDER e da SINE50/DIAMOND (intro).
+  GNBG_I/J/Y/X ($BC-$C3): indici del rendering tunnel; alias anche
+    come INTRO_TMP_A/B, SINE_EDI/EBP/DL durante l'intro (mai attivi
+    insieme al tunnel vero).
+  DAISY_X/Y/DX/DY/CNTR/PHASE/FRAME ($C4-$D0): stato persistente della
+    margherita che ruota (nota: pur essendo "scratch-zone" per
+    convenzione di indirizzo, questi campi si comportano come il
+    Gruppo A - vanno letti come stato persistente della margherita,
+    non ricalcolati ogni volta).
+  DIAMOND_LOC/LOCD/LEN/LEND, SINE50_CNTR, WIPE_LOC ($D4-$DB): fasi
+    dell'intro non piu' tutte attive contemporaneamente al tunnel.
+  PAIR_IDX/YSTEP/WRITE_X1/X2 ($EC-$F3): rendering tunnel riga-per-riga.
+  BLIT_PTR/BASE_X/BASE_Y/LEN/COLOR/SCRATCH/SCRATCH2/HINIB ($A8-$BE):
+    parametri generici di disegno diretto in VRAM, usati da
+    BLIT_SPRITE, PLOT_PIXEL/PLOT_STREAK/PLOT_SNOWFLAKE(2X2) e da
+    SET_SCB_RANGE. Sono scratch puro: impostati dal chiamante subito
+    prima di ogni chiamata, mai persistenti fra un frame e l'altro.
+
+Le nuove RAIN2_CNTR/NUM/NUMD e SNOW_CNTR/NUM/NUMD (stato di R_L1P80 e
+R_L1P60) sono state messe VOLUTAMENTE fuori dalla zero page, come dati
+assoluti nel banco $00 (etichette normali, non EQU su indirizzo fisso):
+la zero page libera nella zona "Gruppo A" era piena, e questi due nuovi
+effetti hanno bisogno anche loro di stato persistente turno-su-turno
+(esattamente come R_L1P90), quindi non potevano usare la zona scratch
+$80-$FF. Le tabelle di posizione RAIN2_*/SNOW_* (64+32+16 elementi *2
+per ciascuno dei due effetti) sono anch'esse dati assoluti nel banco
+$00, precalcolate una volta con uno script Python (stessa tecnica gia'
+usata per LEAFX_TABLE/LEAFY_TABLE) invece di rifare a runtime il ciclo
+di inizializzazione "static...first" del C originale.
+
+
+---------------------------------------------------------------------------
+3) ROUTINE PRINCIPALI E COME VENGONO CHIAMATE
+---------------------------------------------------------------------------
+
+START (una volta sola all'avvio)
+  SEI -> inizializza palette (INIT_PALETTE), texture offscreen
+  (CLEAR_OFFSCREEN_FLAT), tabella tunnel (INIT_GNBGTBL), PACKLUT
+  (INIT_PACKLUT), musica (MUSIC_INIT) e azzera/inizializza TUTTI i
+  campi di stato persistente (pesce, lumaca, icona, R_L1P90, intro,
+  faccine/orbita, margherita, e ora anche RAIN2_*/SNOW_* per le due
+  nuove routine) -> salta a MAIN_LOOP.
+
+MAIN_LOOP (ciclo principale, per sempre)
+  JSR TS3_UPDATE_MOVERS      ; muove pesce/lumaca/vista
+  incrementa FRAME_CNT (mod 16)
+  JSR INTRO_STEP             ; dispatcher delle fasi intro (curva/
+                              ; punti/linee/margherite a cluster),
+                              ; PRIMA del render cosi' i pixel
+                              ; appena disegnati sono gia' visibili
+  JSR DRAW_FRAME_MARKER
+  JSR WAIT_VBL                ; sincronizza al refresh video
+  se TEXTURE_PREVIEW_MODE: JSR SHOW_TEXTURE_DIRECT (anteprima texture)
+  altrimenti:                 JSR GNBG_RENDER (tunnel prospettico vero)
+  JSR DRAW_SPRITES             -> JSR UPDATE_L1 (vedi sotto)
+  JSR MUSIC_PLAY
+  JSR CHECK_KEYBOARD           ; SPAZIO cambia TEXTURE_PREVIEW_MODE,
+                                ; ESC esce, tasti 1-8 cambiano fase
+                                ; texture/intro (invariato da tl56r)
+  BRA MAIN_LOOP
+
+UPDATE_L1 / L1_TABLE / L1_INDEX (dispatcher "una routine attiva per
+volta", stile l1rout/l1setnext del C originale)
+  Legge L1_INDEX, prende l'indirizzo in L1_TABLE, chiama SOLO quella
+  routine (indicizzazione assoluta, non JMP indicizzato - vedi commento
+  storico "TL43 FIX" nel sorgente). Ogni routine attiva gestisce da
+  sola il proprio contatore di turno e chiama L1_SETNEXT (incrementa
+  L1_INDEX mod L1_COUNT) quando il suo turno finisce.
+
+  L1_COUNT EQU 9   (era 7 in tl56r.s)
+  L1_TABLE:
+    1. R_L1P00  - margherita che ruota
+    2. R_L1P10  - pesce
+    3. R_L1P20  - lumaca
+    4. R_L1P50  - icona/petali che volano
+    5. R_L1P90  - pioggia/foglie/cuoricini (sprite, gia' presente)
+    6. R_L1P60  - NEVE VERA (nuova in tl57: blocchetti/fiocchi)
+    7. R_L1P80  - PIOGGIA VERA (nuova in tl57: righette diagonali)
+    8. R_L1P30  - faccine
+    9. R_L1P70  - orbita
+
+  Nessun tasto dedicato per selezionare direttamente neve/pioggia per
+  ora (scelta esplicita: prima si verifica che il ciclo automatico
+  funzioni bene, la selezione manuale si aggiungera' in un secondo
+  momento).
+
+R_L1P80 - pioggia vera (nuova)
+  Porting fedele di r_l1p80 in timeless.c: 3 gruppi di particelle (64
+  piccole/veloci, 32 medie, 16 grandi/lente - il gruppo da 64 viene
+  pero' mosso/disegnato solo per i primi 32 indici, un refuso
+  dell'originale riprodotto identico per fedelta'), ognuna disegna un
+  segmento diagonale di 4/8/16 pixel scrivendo DIRETTAMENTE in VRAM
+  (nessuno sprite, nessuna SET_SCB_RANGE: colore fisso $0A, indice 10
+  della palette = ciano, identico nei 4 temi). RAIN2_CNTR conta 240->0
+  il turno, RAIN2_NUM/NUMD rampano 0->16->0 pilotando quante particelle
+  sono attive. Le coordinate vengono aggiornate nelle tabelle
+  RAIN2_Y0/X0/Y1/X1/Y2/X2 con wrap Y a 202/204/208 (per tier) e wrap X
+  solo sul lato negativo (+320), esattamente come il C.
+
+R_L1P60 - neve vera (nuova)
+  Stessa architettura a 3 livelli (64/32/16 particelle) ma disegna
+  blocchetti invece di righe: 1 pixel (livello piccolo), quadrato 2x2
+  (livello medio), un piccolo esagono/diamante 4 righe non uniformi
+  (livello grande, replica esatta dei 4 memset del C, non un quadrato
+  4x4 pieno). Colore fisso $0F, indice 15 = bianco. Qui il gruppo da 64
+  e' usato per intero (nessun refuso, a differenza della pioggia). Wrap
+  Y sempre a 200 per tutti e tre i livelli (a differenza della pioggia,
+  qui la Y virtuale del C non supera mai 199). Piccola differenza
+  fedele dal C anche nella condizione di azzeramento di NUMD: qui e'
+  "num >= 16", nella pioggia e' "num == 16" (esattamente come
+  nell'originale).
+
+PLOT_PIXEL / PLOT_STREAK / PLOT_SNOWFLAKE / PLOT_SNOWFLAKE2X2 (nuove,
+condivise dalle due routine sopra)
+  Primitiva di disegno diretto in VRAM (stesso calcolo di indirizzo
+  nibble gia' usato da BLIT_SPRITE), MA con clipping vero: se il pixel
+  cade fuori dalle 320x200 righe/colonne reali viene semplicemente
+  SALTATO (RTS senza scrivere), niente clamp che schiaccia sul bordo.
+  Questa e' la lezione imparata dal bug di R_L1P90 (vedi sotto):
+  scrivere anche un solo pixel oltre riga 199 nel banco $01 corrompe
+  SCB/palette per lo shadowing hardware, quindi meglio scartare il
+  pixel che clampare.
+
+Fix applicato a R_L1P90 in questa versione (gia' validato in tl56d.s)
+  BLIT_BASE_X e BLIT_BASE_Y avevano solo un clamp inferiore (minimo 0),
+  nessun clamp superiore. leafx/leafy (costanti di wrap prese dal C,
+  tarate su un canvas virtuale piu' grande, 400x280 contro il nostro
+  320x200 reale) potevano arrivare a generare BLIT_BASE_X=320 o
+  BLIT_BASE_Y=200, un pixel/riga oltre lo schermo reale. Siccome
+  BLIT_SPRITE non fa alcun bound-check, questo scriveva dentro la SCB
+  e la palette hardware (vedi banco $E1 sopra), causando colori strani
+  e sporcizia progressiva sullo sfondo. Aggiunto un clamp superiore
+  (max 290 per X, max 170 per Y - margine di sicurezza di 30px, lo
+  stesso gia' usato per SNAIL_Y in una versione precedente per lo
+  stesso identico motivo).
+
+
+---------------------------------------------------------------------------
+4) COSA MANCA ANCORA
+---------------------------------------------------------------------------
+  - r_l1p40 del C originale: l'icona con occhi/ali che vola (diversa
+    da R_L1P50, l'icona/petali gia' presente) - rimandata a una
+    versione futura.
+  - Selezione manuale via tasti delle singole sequenze L1 (1..9, 0):
+    per ora neve e pioggia entrano solo nel ciclo automatico.
