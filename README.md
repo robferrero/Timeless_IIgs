@@ -60,7 +60,7 @@ and as always
 
 great hello to Dadopado and CCSuperstar !
 
-<img src="timeles_pic1.png" alt="Logo del progetto" width="300">
+<img src="timeless_pic1.png" alt="Timeless_//gs" width="300">
 
 19/10/2026  Dark Phoenix and Homer (homer.control@gmail.com)
 
